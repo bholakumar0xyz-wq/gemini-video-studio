@@ -70,6 +70,10 @@ def start():
                         "error": "Pehle Gemini API key save karo (neeche Settings me)"}), 400
     job_id = uuid.uuid4().hex[:10]
     job_dir = os.path.join(JOBS, job_id)
+    # Ek waqt me sirf ek video — free server ki memory (512MB) do sath
+    # chal rahe ffmpeg encode se full ho kar crash ho jaati hai.
+    if any(j.get("status") == "running" for j in jobs.values()):
+        return jsonify({"ok": False, "error": "Ek video abhi ban rahi hai, 2-3 minute ruk kar dobara try karo"}), 429
     cfg = {
         "script": script,
         "demo": demo,

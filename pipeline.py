@@ -305,7 +305,7 @@ def make_scene_clip(image_path, audio_path, clip_path, w, h,
                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps=30")
     cmd = ["ffmpeg", "-y", "-loop", "1", "-i", image_path, "-i", audio_path,
            "-vf", vf, "-map", "0:v", "-map", "1:a",
-           "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+           "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "128k", "-shortest", clip_path]
     r = run(cmd)
     if r.returncode != 0 or not os.path.exists(clip_path):
@@ -323,7 +323,7 @@ def make_scene_clip(image_path, audio_path, clip_path, w, h,
                 f"x=(w-text_w)/2:y=h-text_h-{int(h*0.08)}")
         tmp = clip_path + ".cap.mp4"
         r = run(["ffmpeg", "-y", "-i", clip_path, "-vf", draw,
-                 "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+                 "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
                  "-c:a", "copy", tmp])
         os.remove(cap_file)
         if r.returncode == 0 and os.path.exists(tmp):
@@ -346,7 +346,7 @@ def concat_and_finish(clip_paths, final_path, fps=30):
     r = run(["ffmpeg", "-y", "-i", tmp,
              "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
              "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
-             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
              "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
              final_path])
     os.remove(tmp)
