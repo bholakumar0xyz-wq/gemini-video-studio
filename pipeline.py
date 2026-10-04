@@ -299,17 +299,14 @@ def generate_tts_free(text, voice, out_mp3, speed=100):
 
 def make_scene_clip(image_path, audio_path, clip_path, w, h,
                      kenburns=True, caption_text=None, font=None):
+    # Single-pass: caption isi encode me jalao (doosra decode+encode pass
+    # memory double kar deta tha). ultrafast + threads 2 = ~150MB peak,
+    # taaki 512MB free server par OOM na ho.
     vf = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
     if kenburns:
         vf += (",zoompan=z='min(zoom+0.0012,1.12)':d=1:"
                f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps=30")
-    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", image_path, "-i", audio_path,
-           "-vf", vf, "-map", "0:v", "-map", "1:a",
-           "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-           "-c:a", "aac", "-b:a", "128k", "-shortest", clip_path]
-    r = run(cmd)
-    if r.returncode != 0 or not os.path.exists(clip_path):
-        raise RuntimeError(f"Scene clip fail: {r.stderr[-500:]}")
+    cap_file = None
     if caption_text and font:
         import textwrap
         wrapped = "\n".join(textwrap.wrap(caption_text, width=32))
@@ -317,17 +314,20 @@ def make_scene_clip(image_path, audio_path, clip_path, w, h,
         with open(cap_file, "w", encoding="utf-8") as f:
             f.write(wrapped)
         fs = int(w * 0.055)
-        draw = (f"drawtext=fontfile='{font}':textfile='{cap_file}':"
-                f"fontsize={fs}:fontcolor=white:borderw=3:bordercolor=black@0.8:"
-                f"line_spacing=8:"
-                f"x=(w-text_w)/2:y=h-text_h-{int(h*0.08)}")
-        tmp = clip_path + ".cap.mp4"
-        r = run(["ffmpeg", "-y", "-i", clip_path, "-vf", draw,
-                 "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                 "-c:a", "copy", tmp])
+        vf += (f",drawtext=fontfile='{font}':textfile='{cap_file}':"
+               f"fontsize={fs}:fontcolor=white:borderw=3:bordercolor=black@0.8:"
+               f"line_spacing=8:"
+               f"x=(w-text_w)/2:y=h-text_h-{int(h*0.08)}")
+    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", image_path, "-i", audio_path,
+           "-vf", vf, "-map", "0:v", "-map", "1:a",
+           "-c:v", "libx264", "-preset", "ultrafast", "-threads", "2",
+           "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "128k", "-shortest", clip_path]
+    r = run(cmd)
+    if cap_file and os.path.exists(cap_file):
         os.remove(cap_file)
-        if r.returncode == 0 and os.path.exists(tmp):
-            os.replace(tmp, clip_path)
+    if r.returncode != 0 or not os.path.exists(clip_path):
+        raise RuntimeError(f"Scene clip fail: {r.stderr[-500:]}")
     return clip_path
 
 
@@ -342,11 +342,12 @@ def concat_and_finish(clip_paths, final_path, fps=30):
     os.remove(lst)
     if r.returncode != 0 or not os.path.exists(tmp):
         raise RuntimeError(f"Concat fail: {r.stderr[-500:]}")
-    # Loudness normalize LAST (ffmpeg gotcha: loudnorm must come after adelay/pad)
+    # Loudness normalize LAST (ffmpeg gotcha: loudnorm must come after adelay/pad).
+    # Video ko dobara encode NAHI karte (-c:v copy) — sirf audio normalize,
+    # taaki memory low rahe (poora 1080x1920 re-encode OOM kar deta tha).
     r = run(["ffmpeg", "-y", "-i", tmp,
-             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
              "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
-             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+             "-c:v", "copy",
              "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
              final_path])
     os.remove(tmp)
