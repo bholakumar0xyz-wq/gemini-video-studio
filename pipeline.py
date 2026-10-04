@@ -248,7 +248,7 @@ def generate_image_free(prompt_en, w, h, retries=3):
             seed = random.randint(1, 999999)
             q = urllib.parse.quote((prompt_en or "")[:600])
             url = (f"https://image.pollinations.ai/prompt/{q}"
-                   f"?width={w}&height={h}&nologo=true&seed={seed}&model=flux")
+                   f"?width={w}&height={h}&nologo=true&seed={seed}&model=turbo")
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=180) as r:
                 data = r.read()
