@@ -237,29 +237,36 @@ def friendly_ai_error(e):
     return s[:300]
 
 
-def generate_image_free(prompt_en, w, h, retries=3):
-    """Pollinations.ai — free, bina API key ke. Thodi kam quality, lifetime free."""
+def generate_image_free(prompt_en, w, h, retries=5):
+    """Pollinations.ai — free, bina API key ke. Thodi kam quality, lifetime free.
+    Free tier par kabhi-kabhi rate-limit (402) lagta hai — lambe wait ke saath
+    retry karta hai taaki video rukhe nahi."""
     import urllib.request
     import urllib.parse
     import random
+    backoffs = [5, 15, 40, 90, 180]
     last = None
-    for attempt in range(retries):
-        try:
-            seed = random.randint(1, 999999)
-            q = urllib.parse.quote((prompt_en or "")[:600])
-            url = (f"https://image.pollinations.ai/prompt/{q}"
-                   f"?width={w}&height={h}&nologo=true&seed={seed}&model=turbo")
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=180) as r:
-                data = r.read()
-                ctype = r.headers.get("Content-Type", "")
-            if ctype.startswith("image/") and len(data) > 15000:
-                return data
-            last = RuntimeError(f"bad image (type={ctype}, {len(data)} bytes)")
-        except Exception as e:  # noqa: BLE001
-            last = e
-            time.sleep(4 * (attempt + 1))
-    raise RuntimeError("Free image service busy hai, thodi der me dobara try karo. "
+    for model in ("turbo", None):  # turbo free; default fallback
+        for attempt in range(retries):
+            try:
+                seed = random.randint(1, 999999)
+                q = urllib.parse.quote((prompt_en or "")[:600])
+                url = (f"https://image.pollinations.ai/prompt/{q}"
+                       f"?width={w}&height={h}&nologo=true&seed={seed}")
+                if model:
+                    url += f"&model={model}"
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=180) as r:
+                    data = r.read()
+                    ctype = r.headers.get("Content-Type", "")
+                if ctype.startswith("image/") and len(data) > 15000:
+                    return data
+                last = RuntimeError(f"bad image (type={ctype}, {len(data)} bytes)")
+            except Exception as e:  # noqa: BLE001
+                last = e
+            time.sleep(backoffs[min(attempt, len(backoffs) - 1)])
+    raise RuntimeError("Free image service bahut busy hai. 10-15 minute ruk kar "
+                       "dobara try karo. "
                        f"({str(last)[:120]})")
 
 
@@ -463,7 +470,8 @@ def run_job(job_dir, cfg, progress):
             if dur < 0.8:
                 raise RuntimeError(f"Scene {i+1} ka audio khaali hai, dobara try karo")
             assets.append((img_path, audio_path))
-            time.sleep(1)
+            # Free image service par rate-limit na lage, isliye halka gap
+            time.sleep(12 if use_free else 1)
 
     progress(75, "Scenes ko video me jod raha hoon (editing)...")
     clips = []
