@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 import wave
 
@@ -85,8 +86,6 @@ def get_client(api_key):
 
 def split_scenes(api_key, script, progress=None):
     """Script ko scene-wise todo: har scene = voiceover line + English image prompt."""
-    from google.genai import types
-    client = get_client(api_key)
     system = (
         "You split a Hindi voiceover script into scenes for an AI video. "
         "Return ONLY a JSON array, no markdown fences. Each item: "
@@ -97,29 +96,34 @@ def split_scenes(api_key, script, progress=None):
         "Make 6-14 scenes for a typical script. Cover the whole script in order."
     )
     last_err = None
-    for model in TEXT_MODELS:
-        try:
-            resp = client.models.generate_content(
-                model=model,
-                contents=script,
-                config=types.GenerateContentConfig(system_instruction=system,
-                                                   temperature=0.4),
-            )
-            txt = (resp.text or "").strip()
-            txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", txt, flags=re.S)
-            scenes = json.loads(txt)
-            if isinstance(scenes, list) and scenes:
-                clean = []
-                for s in scenes:
-                    vt = str(s.get("voice_text", "")).strip()
-                    ip = str(s.get("image_prompt", "")).strip()
-                    if vt and ip:
-                        clean.append({"voice_text": vt, "image_prompt": ip})
-                if clean:
-                    return clean
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            continue
+    try:
+        from google.genai import types
+        client = get_client(api_key)
+        for model in TEXT_MODELS:
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=script,
+                    config=types.GenerateContentConfig(system_instruction=system,
+                                                       temperature=0.4),
+                )
+                txt = (resp.text or "").strip()
+                txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", txt, flags=re.S)
+                scenes = json.loads(txt)
+                if isinstance(scenes, list) and scenes:
+                    clean = []
+                    for s in scenes:
+                        vt = str(s.get("voice_text", "")).strip()
+                        ip = str(s.get("image_prompt", "")).strip()
+                        if vt and ip:
+                            clean.append({"voice_text": vt, "image_prompt": ip})
+                    if clean:
+                        return clean
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                continue
+    except Exception as e:  # noqa: BLE001
+        last_err = e
     # Fallback: script ko khud lines me todo
     if progress:
         progress("AI scene-split fail hua, manual split use kar raha hoon")
@@ -215,6 +219,73 @@ def generate_tts(client, text, voice, model_id, wav_path, retries=3):
             last = e
             time.sleep(3 * (attempt + 1))
     raise RuntimeError(f"TTS fail: {last}")
+
+
+# ---------------- FREE engines (lifetime free, koi billing nahi) ----------------
+
+FREE_EDGE_VOICES = {"male": "hi-IN-MadhurNeural", "female": "hi-IN-SwaraNeural"}
+FREE_IMG_SIZE = {"vertical": (768, 1360), "horizontal": (1360, 768)}
+
+
+def friendly_ai_error(e):
+    s = str(e)
+    if "429" in s or "RESOURCE_EXHAUSTED" in s or "quota" in s.lower():
+        return ("Google AI ki free limit khatam ho gayi hai ya is model par "
+                "free quota nahi hai. Thodi der ruk kar dobara try karo.")
+    if "API key" in s or "API_KEY" in s or "401" in s or "403" in s:
+        return "API key me problem hai. Settings me key dobara save karo."
+    return s[:300]
+
+
+def generate_image_free(prompt_en, w, h, retries=3):
+    """Pollinations.ai — free, bina API key ke. Thodi kam quality, lifetime free."""
+    import urllib.request
+    import urllib.parse
+    import random
+    last = None
+    for attempt in range(retries):
+        try:
+            seed = random.randint(1, 999999)
+            q = urllib.parse.quote((prompt_en or "")[:600])
+            url = (f"https://image.pollinations.ai/prompt/{q}"
+                   f"?width={w}&height={h}&nologo=true&seed={seed}&model=flux")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                data = r.read()
+                ctype = r.headers.get("Content-Type", "")
+            if ctype.startswith("image/") and len(data) > 15000:
+                return data
+            last = RuntimeError(f"bad image (type={ctype}, {len(data)} bytes)")
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(4 * (attempt + 1))
+    raise RuntimeError("Free image service busy hai, thodi der me dobara try karo. "
+                       f"({str(last)[:120]})")
+
+
+def generate_tts_free(text, voice, out_mp3, speed=100):
+    """edge-tts (Microsoft, free Hindi voices) primary, gTTS backup. Dono free."""
+    # 1) edge-tts
+    try:
+        rate = f"{int(speed) - 100:+d}%"
+        r = subprocess.run(
+            [sys.executable, "-m", "edge_tts", "--voice", voice,
+             "--rate", rate, "--text", text, "--write-media", out_mp3],
+            capture_output=True, text=True, timeout=150)
+        if r.returncode == 0 and os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 2000:
+            return out_mp3
+    except Exception:  # noqa: BLE001
+        pass
+    # 2) gTTS backup
+    try:
+        from gtts import gTTS
+        gTTS(text, lang="hi").save(out_mp3)
+        if os.path.exists(out_mp3) and os.path.getsize(out_mp3) > 2000:
+            return out_mp3
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("Free voice service busy hai, thodi der me dobara try karo. "
+                           f"({str(e)[:120]})")
+    raise RuntimeError("Free voice service se audio nahi bana, dobara try karo.")
 
 
 # ---------------- ffmpeg edit ----------------
@@ -327,8 +398,13 @@ def run_job(job_dir, cfg, progress):
             scenes.append({"voice_text": buf, "image_prompt": buf})
         scenes = scenes[:8] or [{"voice_text": "Demo scene", "image_prompt": "demo"}]
     else:
-        client = get_client(cfg["api_key"])
-        scenes = split_scenes(cfg["api_key"], cfg["script"], progress=lambda t: progress(8, t))
+        # NOTE: client sirf paid/Gemini path me chahiye; free path me nahi.
+        client = None
+        try:
+            scenes = split_scenes(cfg.get("api_key"), cfg["script"],
+                                  progress=lambda t: progress(8, t))
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(friendly_ai_error(e))
 
     n = len(scenes)
     assets = []
@@ -336,31 +412,57 @@ def run_job(job_dir, cfg, progress):
         progress(15, "Demo assets bana raha hoon...")
         assets = demo_assets(job_dir, scenes, fmt)
     else:
-        img_model = IMAGE_MODELS[cfg.get("quality", "fast")]
-        tts_model = TTS_MODELS[cfg.get("quality", "fast")]
-        voice = DEFAULT_VOICES.get(cfg.get("voice", "male"), "Kore")
+        use_free = (cfg.get("quality", "free") == "free")
+        if use_free:
+            # Lifetime free: images Pollinations se, voice edge-tts/gTTS se.
+            # Scene-split Gemini text se (free tier par chalta hai).
+            fw, fh = FREE_IMG_SIZE[cfg.get("format", "vertical")]
+            edge_voice = FREE_EDGE_VOICES.get(cfg.get("voice", "male"),
+                                              "hi-IN-MadhurNeural")
+        else:
+            client = get_client(cfg["api_key"])
+            img_model = IMAGE_MODELS[cfg.get("quality", "fast")]
+            tts_model = TTS_MODELS[cfg.get("quality", "fast")]
+            voice = DEFAULT_VOICES.get(cfg.get("voice", "male"), "Kore")
         for i, sc in enumerate(scenes):
             base = 10 + int(60 * i / n)
             progress(base, f"Image bana raha hoon... ({i+1}/{n})")
             iprompt = (f"{sc['image_prompt']}, {style_txt}, "
                        f"vertical composition, no text, no watermark, no logo")
-            img_bytes = generate_image(client, iprompt, fmt["aspect"], img_model)
             img_path = os.path.join(job_dir, f"scene_{i:02d}.png")
+            if use_free:
+                try:
+                    img_bytes = generate_image_free(iprompt, fw, fh)
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(friendly_ai_error(e))
+            else:
+                try:
+                    img_bytes = generate_image(client, iprompt, fmt["aspect"], img_model)
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(friendly_ai_error(e))
             with open(img_path, "wb") as f:
                 f.write(img_bytes)
 
             progress(base + 2, f"Voiceover bana raha hoon... ({i+1}/{n})")
-            wav_path = os.path.join(job_dir, f"scene_{i:02d}.wav")
-            # TTS speed: Gemini 3.8 line-by-line direction support karta hai
-            speed_dir = ""
-            if cfg.get("speed", 100) != 100:
-                speed_dir = ("[speak faster]" if cfg["speed"] > 100 else "[speak slower]") + " "
-            generate_tts(client, speed_dir + sc["voice_text"], voice,
-                         tts_model, wav_path)
-            dur = ffprobe_duration(wav_path)
+            if use_free:
+                audio_path = os.path.join(job_dir, f"scene_{i:02d}.mp3")
+                generate_tts_free(sc["voice_text"], edge_voice, audio_path,
+                                  speed=cfg.get("speed", 100))
+            else:
+                audio_path = os.path.join(job_dir, f"scene_{i:02d}.wav")
+                # TTS speed: Gemini 3.8 line-by-line direction support karta hai
+                speed_dir = ""
+                if cfg.get("speed", 100) != 100:
+                    speed_dir = ("[speak faster]" if cfg["speed"] > 100 else "[speak slower]") + " "
+                try:
+                    generate_tts(client, speed_dir + sc["voice_text"], voice,
+                                 tts_model, audio_path)
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(friendly_ai_error(e))
+            dur = ffprobe_duration(audio_path)
             if dur < 0.8:
-                raise RuntimeError(f"Scene {i+1} ka audio khaali hai")
-            assets.append((img_path, wav_path))
+                raise RuntimeError(f"Scene {i+1} ka audio khaali hai, dobara try karo")
+            assets.append((img_path, audio_path))
             time.sleep(1)
 
     progress(75, "Scenes ko video me jod raha hoon (editing)...")

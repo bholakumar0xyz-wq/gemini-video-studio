@@ -1,3 +1,5 @@
 flask>=3.0
 google-genai>=1.0
 gunicorn>=22.0
+edge-tts>=7.0
+gtts>=2.5

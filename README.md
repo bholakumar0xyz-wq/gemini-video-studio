@@ -6,13 +6,15 @@ Har scene ki image uski voice line se 100% match hoti hai (scene-by-scene pipeli
 ## Kaise kaam karta hai
 
 1. **Script** paste karo (Hindi — Devanagari ya Roman, dono chalega)
-2. Gemini script ko **scenes** me todta hai — har scene ke liye:
+2. Gemini script ko **scenes** me todta hai (free) — har scene ke liye:
    - English **image prompt** (scene ke hisaab se)
    - Exact **voiceover line**
-3. Har scene ki **image** banti hai (Nano Banana image model)
-4. Har scene ki **voiceover** banti hai (Gemini TTS — purush/mahila voice)
+3. Har scene ki **image** banti hai (Free AI image generator — bina API key, lifetime free)
+4. Har scene ki **voiceover** banti hai (Free Hindi AI voice — purush/mahila)
 5. **ffmpeg** har scene ko jodta hai: slow zoom motion + Hindi captions + loudness normalize
 6. **Download** karo — 1080x1920 (Shorts/Reels) ya 1920x1080 (YouTube)
+
+> 🆓 **100% free, lifetime** — koi billing nahi, koi card nahi. Quality thodi kam ho sakti hai paid AI se, lekin sab kuch free me chalta rahega.
 
 ## Step 1: Gemini API Key (free, mobile se)
 
