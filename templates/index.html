@@ -117,7 +117,7 @@ async function startJob(demo){
 async function poll(id){
   const r = await fetch('/api/status/'+id);
   const d = await r.json();
-  if(!d.ok){ clearInterval(timer); return; }
+  if(!d.ok){ clearInterval(timer); $('errmsg').textContent='Server restart ho gaya tha, dobara Video Banao dabao'; show($('err')); $('go').disabled=false; return; }
   $('barfill').style.width = d.percent + '%';
   $('pct').textContent = d.percent + '%';
   $('stage').textContent = d.stage || '';
