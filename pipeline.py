@@ -1,0 +1,388 @@
+# -*- coding: utf-8 -*-
+"""
+Gemini Video Studio - core pipeline
+Script -> scenes (Gemini text) -> images (Gemini image gen) ->
+voiceover (Gemini TTS) -> video edit (ffmpeg, scene-by-scene match)
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+import wave
+
+# ---- Model IDs (latest verified Oct 2026, user-changeable in UI) ----
+TEXT_MODELS = ["gemini-3.7-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
+IMAGE_MODELS = {
+    "fast": "gemini-3.1-flash-image-preview",   # Nano Banana 2 - tez/sasta
+    "pro": "gemini-3-pro-image-preview",        # Nano Banana Pro - best quality
+}
+TTS_MODELS = {
+    "fast": "gemini-3.8-flash-lite-tts",
+    "pro": "gemini-3.8-flash-tts",
+}
+DEFAULT_VOICES = {
+    "male": "Kore",
+    "female": "Aoede",
+}
+
+FORMATS = {
+    "vertical": {"w": 1080, "h": 1920, "aspect": "9:16"},
+    "horizontal": {"w": 1920, "h": 1080, "aspect": "16:9"},
+}
+
+STYLES = {
+    "cinematic": "cinematic photorealistic film still, dramatic lighting, high detail",
+    "cartoon": "vibrant 3D cartoon animation style, Pixar-like, colorful, kid-friendly",
+    "realistic": "ultra photorealistic photograph, natural lighting, National Geographic style",
+    "painting": "beautiful digital painting, rich colors, artistic illustration",
+}
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def ffprobe_duration(path):
+    r = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path])
+    try:
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def find_caption_font(text=""):
+    """Bundled Mukta-Bold (Devanagari + Latin dono), phir system fonts."""
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "static", "fonts", "Mukta-Bold.ttf")
+    cands = [bundled]
+    if re.search(r"[\u0900-\u097F]", text or ""):
+        cands += [
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        ]
+    else:
+        cands += [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]
+    for p in cands:
+        if os.path.exists(p):
+            return p
+    r = run(["fc-match", "sans-serif:weight=bold", "--format=%{file}\n"])
+    p = r.stdout.strip().splitlines()
+    return p[0] if p and os.path.exists(p[0]) else None
+
+
+# ---------------- Gemini helpers ----------------
+
+def get_client(api_key):
+    from google import genai
+    return genai.Client(api_key=api_key)
+
+
+def split_scenes(api_key, script, progress=None):
+    """Script ko scene-wise todo: har scene = voiceover line + English image prompt."""
+    from google.genai import types
+    client = get_client(api_key)
+    system = (
+        "You split a Hindi voiceover script into scenes for an AI video. "
+        "Return ONLY a JSON array, no markdown fences. Each item: "
+        '{"voice_text": "exact Hindi line as in script (1-2 sentences)", '
+        '"image_prompt": "detailed English visual prompt describing the scene, '
+        'cinematic, no text, no watermark, no humans unless narrated"}. '
+        "Keep voice_text EXACTLY from the script (no rewording). "
+        "Make 6-14 scenes for a typical script. Cover the whole script in order."
+    )
+    last_err = None
+    for model in TEXT_MODELS:
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=script,
+                config=types.GenerateContentConfig(system_instruction=system,
+                                                   temperature=0.4),
+            )
+            txt = (resp.text or "").strip()
+            txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", txt, flags=re.S)
+            scenes = json.loads(txt)
+            if isinstance(scenes, list) and scenes:
+                clean = []
+                for s in scenes:
+                    vt = str(s.get("voice_text", "")).strip()
+                    ip = str(s.get("image_prompt", "")).strip()
+                    if vt and ip:
+                        clean.append({"voice_text": vt, "image_prompt": ip})
+                if clean:
+                    return clean
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    # Fallback: script ko khud lines me todo
+    if progress:
+        progress("AI scene-split fail hua, manual split use kar raha hoon")
+    parts = [p.strip() for p in re.split(r"\n+|।\s*", script) if p.strip()]
+    scenes = []
+    buf = ""
+    for p in parts:
+        buf = (buf + " " + p).strip()
+        if len(buf) > 60:
+            scenes.append(buf)
+            buf = ""
+    if buf:
+        scenes.append(buf)
+    out = []
+    for vt in scenes[:14]:
+        out.append({"voice_text": vt,
+                    "image_prompt": f"Illustration of: {vt[:120]}"})
+    if not out:
+        raise RuntimeError(f"Scene split fail: {last_err}")
+    return out
+
+
+def generate_image(client, prompt, aspect, model_id, retries=3):
+    """Gemini image generation -> PNG bytes."""
+    from google.genai import types
+    cfg = types.GenerateContentConfig(
+        response_modalities=["IMAGE"],
+        image_config=types.ImageConfig(aspect_ratio=aspect),
+    )
+    last = None
+    for attempt in range(retries):
+        try:
+            resp = client.models.generate_content(
+                model=model_id, contents=prompt, config=cfg)
+            for part in getattr(resp, "parts", []) or []:
+                data = getattr(part, "inline_data", None)
+                if data and getattr(data, "data", None):
+                    return data.data
+            cands = getattr(resp, "candidates", []) or []
+            for c in cands:
+                for part in getattr(c.content, "parts", []) or []:
+                    data = getattr(part, "inline_data", None)
+                    if data and getattr(data, "data", None):
+                        return data.data
+            last = RuntimeError("Image data nahi mila response me")
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                time.sleep(8 * (attempt + 1))
+            else:
+                time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"Image gen fail: {last}")
+
+
+def generate_tts(client, text, voice, model_id, wav_path, retries=3):
+    """Gemini TTS -> 24kHz mono WAV."""
+    from google.genai import types
+    cfg = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+            )
+        ),
+    )
+    last = None
+    for attempt in range(retries):
+        try:
+            resp = client.models.generate_content(
+                model=model_id, contents=text, config=cfg)
+            pcm = None
+            for part in getattr(resp, "parts", []) or []:
+                data = getattr(part, "inline_data", None)
+                if data and getattr(data, "data", None):
+                    pcm = data.data
+                    break
+            if pcm is None:
+                for c in getattr(resp, "candidates", []) or []:
+                    for part in getattr(c.content, "parts", []) or []:
+                        data = getattr(part, "inline_data", None)
+                        if data and getattr(data, "data", None):
+                            pcm = data.data
+                            break
+            if pcm:
+                with wave.open(wav_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(24000)
+                    wf.writeframes(pcm)
+                return wav_path
+            last = RuntimeError("Audio data nahi mila")
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"TTS fail: {last}")
+
+
+# ---------------- ffmpeg edit ----------------
+
+def make_scene_clip(image_path, audio_path, clip_path, w, h,
+                     kenburns=True, caption_text=None, font=None):
+    vf = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+    if kenburns:
+        vf += (",zoompan=z='min(zoom+0.0012,1.12)':d=1:"
+               f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps=30")
+    cmd = ["ffmpeg", "-y", "-loop", "1", "-i", image_path, "-i", audio_path,
+           "-vf", vf, "-map", "0:v", "-map", "1:a",
+           "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "128k", "-shortest", clip_path]
+    r = run(cmd)
+    if r.returncode != 0 or not os.path.exists(clip_path):
+        raise RuntimeError(f"Scene clip fail: {r.stderr[-500:]}")
+    if caption_text and font:
+        import textwrap
+        wrapped = "\n".join(textwrap.wrap(caption_text, width=32))
+        cap_file = clip_path + ".caption.txt"
+        with open(cap_file, "w", encoding="utf-8") as f:
+            f.write(wrapped)
+        fs = int(w * 0.055)
+        draw = (f"drawtext=fontfile='{font}':textfile='{cap_file}':"
+                f"fontsize={fs}:fontcolor=white:borderw=3:bordercolor=black@0.8:"
+                f"line_spacing=8:"
+                f"x=(w-text_w)/2:y=h-text_h-{int(h*0.08)}")
+        tmp = clip_path + ".cap.mp4"
+        r = run(["ffmpeg", "-y", "-i", clip_path, "-vf", draw,
+                 "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+                 "-c:a", "copy", tmp])
+        os.remove(cap_file)
+        if r.returncode == 0 and os.path.exists(tmp):
+            os.replace(tmp, clip_path)
+    return clip_path
+
+
+def concat_and_finish(clip_paths, final_path, fps=30):
+    lst = final_path + ".list.txt"
+    with open(lst, "w") as f:
+        for c in clip_paths:
+            f.write(f"file '{os.path.abspath(c)}'\n")
+    tmp = final_path + ".joined.mp4"
+    r = run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+             "-c", "copy", tmp])
+    os.remove(lst)
+    if r.returncode != 0 or not os.path.exists(tmp):
+        raise RuntimeError(f"Concat fail: {r.stderr[-500:]}")
+    # Loudness normalize LAST (ffmpeg gotcha: loudnorm must come after adelay/pad)
+    r = run(["ffmpeg", "-y", "-i", tmp,
+             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+             "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
+             "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+             "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+             final_path])
+    os.remove(tmp)
+    if r.returncode != 0 or not os.path.exists(final_path):
+        raise RuntimeError(f"Final encode fail: {r.stderr[-500:]}")
+    # Verify: audio stream MUST exist
+    r = run(["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "stream=codec_name",
+             "-of", "default=noprint_wrappers=1:nokey=1", final_path])
+    if not r.stdout.strip():
+        raise RuntimeError("Final video me AUDIO TRACK NAHI HAI!")
+    return final_path
+
+
+# ---------------- full job ----------------
+
+def demo_assets(job_dir, scenes, fmt):
+    """Bina API key ke demo: placeholder images + tone audio."""
+    assets = []
+    colors = ["0x1a2a6c", "0xb21f1f", "0x1a6c2a", "0x6c1a5e", "0x8a6d1a",
+              "0x1a6c6c", "0x4a1a6c", "0x6c3a1a"]
+    for i, sc in enumerate(scenes):
+        img = os.path.join(job_dir, f"scene_{i:02d}.png")
+        wav = os.path.join(job_dir, f"scene_{i:02d}.wav")
+        col = colors[i % len(colors)]
+        run(["ffmpeg", "-y", "-f", "lavfi",
+             "-i", f"color=c={col}:s={fmt['w']}x{fmt['h']}:d=3",
+             "-frames:v", "1", img])
+        run(["ffmpeg", "-y", "-f", "lavfi",
+             "-i", "sine=frequency=440:duration=2.5",
+             "-ar", "24000", "-ac", "1", wav])
+        assets.append((img, wav))
+    return assets
+
+
+def run_job(job_dir, cfg, progress):
+    """
+    cfg: {script, api_key|None, demo:bool, voice, quality, format,
+          style, kenburns, captions, speed}
+    """
+    os.makedirs(job_dir, exist_ok=True)
+    fmt = FORMATS[cfg.get("format", "vertical")]
+    style_txt = STYLES.get(cfg.get("style", "cinematic"), STYLES["cinematic"])
+    demo = bool(cfg.get("demo"))
+
+    progress(5, "Script ko scenes me tod raha hoon...")
+    if demo:
+        parts = [p.strip() for p in re.split(r"\n+|।\s*", cfg["script"]) if p.strip()]
+        scenes, buf = [], ""
+        for p in parts:
+            buf = (buf + " " + p).strip()
+            if len(buf) > 50:
+                scenes.append({"voice_text": buf, "image_prompt": buf})
+                buf = ""
+        if buf:
+            scenes.append({"voice_text": buf, "image_prompt": buf})
+        scenes = scenes[:8] or [{"voice_text": "Demo scene", "image_prompt": "demo"}]
+    else:
+        client = get_client(cfg["api_key"])
+        scenes = split_scenes(cfg["api_key"], cfg["script"], progress=lambda t: progress(8, t))
+
+    n = len(scenes)
+    assets = []
+    if demo:
+        progress(15, "Demo assets bana raha hoon...")
+        assets = demo_assets(job_dir, scenes, fmt)
+    else:
+        img_model = IMAGE_MODELS[cfg.get("quality", "fast")]
+        tts_model = TTS_MODELS[cfg.get("quality", "fast")]
+        voice = DEFAULT_VOICES.get(cfg.get("voice", "male"), "Kore")
+        for i, sc in enumerate(scenes):
+            base = 10 + int(60 * i / n)
+            progress(base, f"Image bana raha hoon... ({i+1}/{n})")
+            iprompt = (f"{sc['image_prompt']}, {style_txt}, "
+                       f"vertical composition, no text, no watermark, no logo")
+            img_bytes = generate_image(client, iprompt, fmt["aspect"], img_model)
+            img_path = os.path.join(job_dir, f"scene_{i:02d}.png")
+            with open(img_path, "wb") as f:
+                f.write(img_bytes)
+
+            progress(base + 2, f"Voiceover bana raha hoon... ({i+1}/{n})")
+            wav_path = os.path.join(job_dir, f"scene_{i:02d}.wav")
+            # TTS speed: Gemini 3.8 line-by-line direction support karta hai
+            speed_dir = ""
+            if cfg.get("speed", 100) != 100:
+                speed_dir = ("[speak faster]" if cfg["speed"] > 100 else "[speak slower]") + " "
+            generate_tts(client, speed_dir + sc["voice_text"], voice,
+                         tts_model, wav_path)
+            dur = ffprobe_duration(wav_path)
+            if dur < 0.8:
+                raise RuntimeError(f"Scene {i+1} ka audio khaali hai")
+            assets.append((img_path, wav_path))
+            time.sleep(1)
+
+    progress(75, "Scenes ko video me jod raha hoon (editing)...")
+    clips = []
+    for i, (img, wav) in enumerate(assets):
+        clip = os.path.join(job_dir, f"clip_{i:02d}.mp4")
+        cap = scenes[i]["voice_text"] if cfg.get("captions") else None
+        font = find_caption_font(cap) if cap else None
+        make_scene_clip(img, wav, clip, fmt["w"], fmt["h"],
+                        kenburns=bool(cfg.get("kenburns", True)),
+                        caption_text=cap, font=font)
+        clips.append(clip)
+        progress(75 + int(20 * (i + 1) / len(assets)), f"Editing... ({i+1}/{len(assets)})")
+
+    progress(97, "Final touches (loudness + check)...")
+    final = os.path.join(job_dir, "final_video.mp4")
+    concat_and_finish(clips, final)
+    # cleanup intermediates (images/wavs/clips rakho debug ke liye? nahi - space bachao)
+    for c in clips:
+        try:
+            os.remove(c)
+        except OSError:
+            pass
+    progress(100, "Ho gaya! Video ready hai.")
+    return final
