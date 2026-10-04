@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gemini Video Studio</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="wrap">
+  <h1>🎬 Gemini Video Studio</h1>
+  <p class="sub">Script likho → Gemini se image + voiceover → video ready.<br>
+  Har scene ki image uski voice line se match hogi.</p>
+
+  <div id="keybox" class="card {% if has_key %}hidden{% endif %}">
+    <h3>🔑 Step 1: Gemini API Key</h3>
+    <p>Google AI Studio se free key lo: <b>aistudio.google.com/apikey</b> → "Create API key" → yahan paste karo.</p>
+    <form method="post" action="/save_key">
+      <input type="password" name="api_key" placeholder="API key yahan paste karo" autocomplete="off">
+      <button type="submit">Save Key</button>
+    </form>
+  </div>
+  {% if has_key %}<p class="okmsg">✅ API key saved hai</p>{% endif %}
+
+  <div class="card">
+    <h3>📝 Step 2: Script</h3>
+    <textarea id="script" rows="8" placeholder="Apni Hindi script yahan likho...&#10;&#10;Example:&#10;Samundar ki gehrai me ek vishal jeev rehta hai.&#10;Neeli whale duniya ka sabse bada janwar hai.&#10;Uska dil ek car jitna bada hota hai."></textarea>
+  </div>
+
+  <div class="card">
+    <h3>⚙️ Step 3: Settings</h3>
+    <div class="grid">
+      <label>Voice
+        <select id="voice">
+          <option value="male">👨 Purush</option>
+          <option value="female">👩 Mahila</option>
+        </select>
+      </label>
+      <label>Quality
+        <select id="quality">
+          <option value="fast">⚡ Fast (sasta)</option>
+          <option value="pro">💎 Pro (best)</option>
+        </select>
+      </label>
+      <label>Format
+        <select id="format">
+          <option value="vertical">📱 Vertical 9:16 (Shorts/Reels)</option>
+          <option value="horizontal">🖥️ Horizontal 16:9 (YouTube)</option>
+        </select>
+      </label>
+      <label>Image Style
+        <select id="style">
+          <option value="cinematic">🎥 Cinematic</option>
+          <option value="realistic">📷 Realistic photo</option>
+          <option value="cartoon">🎨 Cartoon 3D</option>
+          <option value="painting">🖌️ Painting</option>
+        </select>
+      </label>
+    </div>
+    <div class="checks">
+      <label><input type="checkbox" id="kenburns" checked> Slow zoom motion (Ken Burns)</label>
+      <label><input type="checkbox" id="captions" checked> Hindi captions video par</label>
+    </div>
+  </div>
+
+  <button id="go" class="bigbtn">🚀 VIDEO BANAO</button>
+  <button id="demo" class="ghostbtn">🧪 Demo chalao (bina API key, test ke liye)</button>
+
+  <div id="prog" class="card hidden">
+    <h3>⏳ Ban raha hai...</h3>
+    <div class="bar"><div id="barfill"></div></div>
+    <p id="stage">...</p>
+    <p id="pct">0%</p>
+  </div>
+
+  <div id="done" class="card hidden">
+    <h3>✅ Video ready!</h3>
+    <a id="dllink" class="bigbtn" href="#">⬇️ DOWNLOAD VIDEO</a>
+  </div>
+
+  <div id="err" class="card hidden errcard">
+    <h3>❌ Error</h3>
+    <p id="errmsg"></p>
+  </div>
+
+  <p class="foot">Images: Gemini (Nano Banana) • Voice: Gemini TTS • Editing: auto</p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let timer = null;
+
+function show(el){ el.classList.remove('hidden'); }
+function hide(el){ el.classList.add('hidden'); }
+
+async function startJob(demo){
+  hide($('done')); hide($('err')); hide($('prog'));
+  $('go').disabled = true;
+  const body = {
+    script: $('script').value,
+    demo: demo,
+    voice: $('voice').value,
+    quality: $('quality').value,
+    format: $('format').value,
+    style: $('style').value,
+    kenburns: $('kenburns').checked,
+    captions: $('captions').checked,
+    speed: 100
+  };
+  const r = await fetch('/api/start', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if(!d.ok){ $('errmsg').textContent = d.error; show($('err')); $('go').disabled=false; return; }
+  show($('prog'));
+  timer = setInterval(()=>poll(d.job_id), 2000);
+}
+
+async function poll(id){
+  const r = await fetch('/api/status/'+id);
+  const d = await r.json();
+  if(!d.ok){ clearInterval(timer); return; }
+  $('barfill').style.width = d.percent + '%';
+  $('pct').textContent = d.percent + '%';
+  $('stage').textContent = d.stage || '';
+  if(d.status === 'done'){
+    clearInterval(timer); hide($('prog')); show($('done'));
+    $('dllink').href = d.result; $('go').disabled = false;
+  } else if(d.status === 'error'){
+    clearInterval(timer); hide($('prog'));
+    $('errmsg').textContent = d.error || 'Kuch gadbad hui';
+    show($('err')); $('go').disabled = false;
+  }
+}
+
+$('go').onclick = () => startJob(false);
+$('demo').onclick = () => startJob(true);
+</script>
+</body>
+</html>
